@@ -2,6 +2,7 @@
 // light, pulses climbing their edges, lit floors here and there, the street
 // reflecting it all. A great tower at the end sends a beam into the clouds and
 // a patrol craft drifts across the sky.
+// media: 1024 427 12 60
 // still: 0
 // detail: -.07 -.02 .07 .5     the great tower and its beam, pulsing
 // detail: .35 -.27 .62 .26     towers either side of the avenue: rooms, pulses
