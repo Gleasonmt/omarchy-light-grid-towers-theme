@@ -51,6 +51,18 @@ float city(vec3 p, vec3 rd, out vec4 tw, out float th, out float box) {
 float nearBox = 1e9, nearT = 0.;
 vec4 nearTw = vec4(0);
 
+// Where a ray enters a tower's box and leaves it; lo holds where it crosses
+// into each axis' slab (the largest is the face it enters through).
+float boxIn(vec3 ro, vec3 rd, vec4 tw, float th, out vec3 lo, out float tout) {
+  vec3 inv = 1. / rd;
+  vec3 bmin = vec3(tw.x - tw.z, 0., tw.y - tw.w), bmax = vec3(tw.x + tw.z, th, tw.y + tw.w);
+  vec3 t0 = (bmin - ro) * inv, t1 = (bmax - ro) * inv;
+  lo = min(t0, t1);
+  vec3 hi = max(t0, t1);
+  tout = min(min(hi.x, hi.y), hi.z);
+  return max(max(lo.x, lo.y), lo.z);
+}
+
 float march(vec3 ro, vec3 rd, float maxT, out vec4 tw, out float th) {
   nearBox = 1e9;
   float passBox = 1e9, passT = 0.;     // closest so far to the tower in this plot
@@ -62,7 +74,9 @@ float march(vec3 ro, vec3 rd, float maxT, out vec4 tw, out float th) {
   vec4 bestTw = vec4(0); float bestTh = 0.;
   for (int i = 0; i < 110; i++) {
     vec3 p = ro + rd * t;
-    if (p.y > 60. && rd.y > 0.) break;
+    // above the tallest tower (54) by more than any near miss that counts
+    // (.66 at most): nothing further on can change the result
+    if (p.y > 54.7 && rd.y > 0.) break;
     float box;
     float d = city(p, rd, tw, th, box);
     if (box < bestBox) { bestBox = box; bestT = t; bestTw = tw; bestTh = th; }
@@ -74,12 +88,21 @@ float march(vec3 ro, vec3 rd, float maxT, out vec4 tw, out float th) {
     if (box < .0008 * t + .001) {
       // close enough: take the exact hit on this tower's box, so edges drawn
       // from the hit point don't flicker into dashes
-      vec3 inv = 1. / rd;
-      vec3 bmin = vec3(tw.x - tw.z, 0., tw.y - tw.w), bmax = vec3(tw.x + tw.z, th, tw.y + tw.w);
-      vec3 t0 = (bmin - ro) * inv, t1 = (bmax - ro) * inv;
-      vec3 lo = min(t0, t1), hi = max(t0, t1);
-      float tin = max(max(lo.x, lo.y), lo.z), tout = min(min(hi.x, hi.y), hi.z);
+      vec3 lo; float tout;
+      float tin = boxIn(ro, rd, tw, th, lo, tout);
       return tin <= tout && tin > 0. && abs(tin - t) < 1. ? tin : t;
+    }
+    // A ray that hits this plot's tower closes in on it in many short steps
+    // (dozens, on a wall seen at a glancing angle), each at least c of the
+    // gap, c the slant it meets the wall at. When it surely gets there within
+    // the step budget, and close enough that the branch above takes the
+    // exact hit, take that hit now.
+    if (th > 0.) {
+      vec3 lo; float tout;
+      float tin = boxIn(ro, rd, tw, th, lo, tout);
+      float c = lo.x >= max(lo.y, lo.z) ? abs(rd.x) : (lo.y >= lo.z ? abs(rd.y) : abs(rd.z));
+      if (tin <= tout && tin > t && tin <= maxT && .0008 * tin + .001 < .5 * c &&
+          float(i) + 3. + log((tin - t) / (.0008 * t + .001)) / -log(1. - min(c, .999)) < 110.) return tin;
     }
     t += d;
     if (t > maxT) break;
@@ -90,11 +113,12 @@ float march(vec3 ro, vec3 rd, float maxT, out vec4 tw, out float th) {
 
 // A glowing line along d = 0, w wide, but at least ~1.5 pixels on screen
 // (fwidth), dimmed as it widens so far lines don't bloom.
-float line(float d, float w) {
-  float aa = min(fwidth(d) * 1.5, w * 4.);
+float line(float d, float w, float fw) {
+  float aa = min(fw * 1.5, w * 4.);
   float ww = max(w, aa);
   return smoothstep(ww, 0., d) * w / ww;
 }
+float line(float d, float w) { return line(d, w, fwidth(d)); }
 
 // Shading of a tower face: near-black glass, light along every edge, a few
 // lit floors, pulses running up the vertical edges.
@@ -166,7 +190,16 @@ float cycleTrail(int i, float z) {
   return smoothstep(1. - len, 1., u) * smoothstep(1., .995, u);
 }   // light from the last towerColor() call's rooms
 
-vec3 towerColor(vec3 p, vec3 rd, vec4 tw, float th, float t) {
+// How far p is from a tower's nearest light strip (x) and from its crown
+// band (y). main() takes their fwidth before branching: a GPU takes it from
+// neighbouring pixels, which a branch leaves out where a tower meets sky or
+// street (the lines there came and went with unrelated code).
+vec2 stripDist(vec3 p, vec4 tw, float th) {
+  float spacing = (4. + 2. * floor(hash11(hash21(tw.xy) * 5.3) * 3.)) * .55;
+  return vec2((.5 - abs(fract(p.y / spacing) - .5)) * spacing, abs(th * .5 - abs(p.y - th * .5) - .45));
+}
+
+vec3 towerColor(vec3 p, vec3 rd, vec4 tw, float th, float t, vec2 fw) {
   vec3 l = p - vec3(tw.x, th * .5, tw.y);
   vec3 b = vec3(tw.z, th * .5, tw.w);
   vec3 q = b - abs(l);                       // distance to each face pair
@@ -199,11 +232,16 @@ vec3 towerColor(vec3 p, vec3 rd, vec4 tw, float th, float t) {
   // pulse slowly and now and then one goes dark for minutes. Farther away,
   // where a window is under a pixel, the facade becomes blocks of lit and
   // dark rooms at a coarser scale, the speckle a city has at night.
-  vec2 fp = vec2(n.x != 0. ? p.z : p.x, p.y) / vec2(.7, .55);
   float side = n.y > .5 ? 0. : smoothstep(.04, .2, abs(dot(n, rd)));   // not on roofs, nor walls seen edge-on
+  gEmit = vec3(0);
+  if (side <= 0.) return col;   // (rooms and strips are all scaled by side)
+  vec2 fp = vec2(n.x != 0. ? p.z : p.x, p.y) / vec2(.7, .55);
   float lod = clamp(log2(px / .16), 0., 5.);
   float l0 = floor(lod);
-  vec3 emit = mix(windows(fp, id, l0), windows(fp, id, l0 + 1.), fract(lod)) * side;
+  // (the coarser level only where it's blended in: near towers are all level 0)
+  vec3 emit = windows(fp, id, l0);
+  if (fract(lod) > 0.) emit = mix(emit, windows(fp, id, l0 + 1.), fract(lod));
+  emit *= side;
   // Light strips, as on the towers of the Grid: a glowing line every few
   // floors on about half the towers (cyan, or orange on the orange-side
   // ones), with a pulse of light running along it (in Lite, a slow
@@ -212,11 +250,11 @@ vec3 towerColor(vec3 p, vec3 rd, vec4 tw, float th, float t) {
   vec3 stripColor = hash11(id * 13.1) > .9 ? ORANGE : CYAN;
   float every = 4. + 2. * floor(hash11(id * 5.3) * 3.);       // every 4, 6 or 8 floors
   float spacing = every * .55;
-  float strip = line((.5 - abs(fract(p.y / spacing) - .5)) * spacing, .06);   // distance to the nearest strip
+  float strip = line((.5 - abs(fract(p.y / spacing) - .5)) * spacing, .06, fw.x);   // distance to the nearest strip
   float run = n.x != 0. ? p.z : p.x;
   float travel = .55 + .9 * exp(-pow(fract(run * .05 - time * .35 + id * 3.) - .5, 2.) * 60.);
   strip *= step(.5, hash11(id * 2.9)) * side * mix(travel, .8 + .2 * sin(time * .5 + id * 20.), detail);
-  float crown = line(abs(ey - .45), .3) * step(30., th) * side;          // a band just under the roof
+  float crown = line(abs(ey - .45), .3, fw.y) * step(30., th) * side;          // a band just under the roof
   gEmit = emit + stripColor * (strip * 1.4 + crown * 1.6);
   return col;
 }
@@ -231,10 +269,14 @@ vec3 sky(vec3 rd, float beamAmt) {
   float star = hash21(floor(sp));
   if (star > .985 && e > .1)
     col += vec3(.6, .85, 1.) * smoothstep(.25, 0., length(fract(sp) - .5)) * (.6 + .4 * sin(ST * (1. + star * 4.) + star * 50.)) * (star - .985) * 30.;
-  vec2 cp = vec2(az * 3. + ST * .01, e * 7.);
-  float cl = fbm(cp + vec2(fbm(cp * 1.3 + ST * .02), 0.));
-  float clouds = smoothstep(.38, .75, cl) * smoothstep(.06, .2, e);
-  col = mix(col, srgb(vec3(.05, .11, .15)), clouds * .8);
+  // clouds only above their band's lower edge (the haze's horizon is below it)
+  float cl = 0., clouds = 0.;
+  if (e > .06) {
+    vec2 cp = vec2(az * 3. + ST * .01, e * 7.);
+    cl = fbm(cp + vec2(fbm(cp * 1.3 + ST * .02), 0.));
+    clouds = smoothstep(.38, .75, cl) * smoothstep(.06, .2, e);
+    col = mix(col, srgb(vec3(.05, .11, .15)), clouds * .8);
+  }
   // the beam lights the clouds around it
   float bw = abs(az);
   col += beamAmt * vec3(.75, .95, 1.) * (exp(-bw * 900.) * 1.2 + exp(-bw * 90.) * .12) * smoothstep(.1, .14, e) * towerPulse();
@@ -263,16 +305,24 @@ void main() {
   vec4 tw; float th;
   float tFloor = rd.y < 0. ? -ro.y / rd.y : 1e9;
   float tT = march(ro, rd, min(tFloor, 320.), tw, th);
+  bool onTower = tT < tFloor && tT < 1e8;
+  // The street's reflection is marched, and every line's fwidth taken, before
+  // branching on what the pixel shows (see stripDist)
+  vec3 pF = ro + rd * tFloor, rr = reflect(rd, vec3(0, 1, 0));
+  vec4 rtw = vec4(0); float rth = 0., tR = 1e9;
+  if (!onTower && tFloor < 1e8) tR = march(pF + rr * .01, rr, 90., rtw, rth);
+  vec2 fwT = fwidth(stripDist(ro + rd * tT, tw, th)), fwR = fwidth(stripDist(pF + rr * tR, rtw, rth));
+  vec2 fwG = fwidth(pF.xz / 4.), fwE = fwidth(vec2(abs(abs(pF.x) - AVENUE_EDGE), abs(pF.x)));
   vec3 col, emit = vec3(0);
   float tHit = min(tT, tFloor);
-  if (tT < tFloor && tT < 1e8) {
+  if (onTower) {
     vec3 p = ro + rd * tT;
-    col = towerColor(p, rd, tw, th, tT);
+    col = towerColor(p, rd, tw, th, tT, fwT);
     emit = gEmit;
   } else if (tFloor < 1e8) {
-    vec3 p = ro + rd * tFloor;
+    vec3 p = pF;
     vec2 g = p.xz / 4.;
-    vec2 fw = fwidth(g), d = abs(fract(g - .5) - .5);
+    vec2 fw = fwG, d = abs(fract(g - .5) - .5);
     vec2 core = 1. - smoothstep(vec2(.0035), .0035 + fw * 1.2, d);
     float lines = max(core.x, core.y) * (1. - smoothstep(.1, .6, max(fw.x, fw.y)));
     col = vec3(.006, .012, .017) + GRID * lines * .6 * exp(-tFloor * .02);
@@ -282,29 +332,30 @@ void main() {
     // the avenue's edges: glowing lines with pulses running along them, and a
     // dimmer center line
     float px = tFloor * 1.5 / (resolution.y * 1.35);
-    float edge = line(abs(abs(p.x) - AVENUE_EDGE), max(.08, px));
+    float edge = line(abs(abs(p.x) - AVENUE_EDGE), max(.08, px), fwE.x);
     float pulseRun = .5 + 1.2 * exp(-pow(fract(p.z * .02 - time * .3 * sign(p.x + .001)) - .5, 2.) * 50.);
-    float center = line(abs(p.x), max(.04, px)) * .35;
+    float center = line(abs(p.x), max(.04, px), fwE.y) * .35;
     col += CYAN * (edge * pulseRun * 2.2 + exp(-abs(abs(p.x) - AVENUE_EDGE) * 2.) * .12 + center) * exp(-tFloor * .006) * shown;
     // light from the cycles and their walls on the street
     for (int i = 0; i < 4; i++) {
       float trail = cycleTrail(i, p.z);
       col += cycleColor(i) * trail * exp(-abs(p.x - LANES[i]) * .9) * 1.3 * exp(-tFloor * .008) * shown;
     }
-    // reflections
-    vec3 rr = reflect(rd, vec3(0, 1, 0));
-    vec4 rtw; float rth;
-    float rt = march(p + rr * .01, rr, 90., rtw, rth);
-    vec3 rcol = sky(rr, .3);
-    if (rt < 1e8) { rcol = towerColor(p + rr * rt, rr, rtw, rth, rt + tFloor); rcol += gEmit * exp(-rt * .02); }
-    // a glossy floor, as on the Grid: the lit city mirrored in it
-    float fres = .22 + .6 * pow(1. - abs(rd.y), 5.);
-    col += rcol * fres * exp(-rt * .008) * 1.1;
+    // reflections (only towers show: a missed ray's exp(-tR * .008) is 0,
+    // so the sky it would have shown is skipped)
+    if (tR < 1e8) {
+      vec3 rcol = towerColor(p + rr * tR, rr, rtw, rth, tR + tFloor, fwR);
+      rcol += gEmit * exp(-tR * .02);
+      // a glossy floor, as on the Grid: the lit city mirrored in it
+      float fres = .22 + .6 * pow(1. - abs(rd.y), 5.);
+      col += rcol * fres * exp(-tR * .008) * 1.1;
+    }
   } else col = sky(rd, 1.);
   // atmosphere: haze thickening with distance, lit from below by the city
   float fog = 1. - exp(-min(tHit, 400.) * .015);
   vec3 haze = srgb(vec3(.025, .07, .095)) + CYAN * .006;
-  haze = mix(haze, sky(normalize(vec3(rd.x, .002, rd.z)), 0.), smoothstep(90., 300., tHit));  // far haze meets the horizon
+  if (tHit > 90. && tHit < 1e8)   // (the sky itself takes no haze)
+    haze = mix(haze, sky(normalize(vec3(rd.x, .002, rd.z)), 0.), smoothstep(90., 300., tHit));  // far haze meets the horizon
   vec3 walls = vec3(0);
   // light-cycles on the avenue, each with its light wall behind it
   // (vertical ribbons on the lane lines, bright along the top)
